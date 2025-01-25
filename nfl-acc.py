@@ -1,429 +1,326 @@
-import pandas as pd
+import pandas as pd 
+from sqlalchemy import create_engine
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import TargetEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import BaseCrossValidator
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 import numpy as np
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-from sklearn.feature_selection import SelectKBest
-from sklearn.preprocessing import MaxAbsScaler, MinMaxScaler, \
-    RobustScaler, StandardScaler, Normalizer
-from scipy.stats import zscore
-from sklearn.preprocessing import MaxAbsScaler, MinMaxScaler, \
-    RobustScaler, StandardScaler, Normalizer
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, \
-    HistGradientBoostingClassifier, IsolationForest
-from sklearn.gaussian_process import GaussianProcessClassifier
-from sklearn.linear_model import PassiveAggressiveClassifier, Perceptron, RidgeClassifier, SGDClassifier, LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, precision_score, recall_score
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.naive_bayes import BernoulliNB, ComplementNB, MultinomialNB, GaussianNB
-from sklearn.neighbors import KNeighborsClassifier, NearestCentroid
-from sklearn.neural_network import MLPClassifier
-from sklearn.svm import LinearSVC, NuSVC, SVC
-from sklearn.tree import ExtraTreeClassifier, DecisionTreeClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
 
+engine = create_engine('mysql+pymysql://root:password@127.0.0.1:3306/sys')    
+print("Connection successful.")
 
+################################################################################
+def fetch_existing_data(
+    engine, 
+    table_name, 
+    cols='*', 
+    joins=None, 
+    groupby=None, 
+    orderby=None
+):
+    """
+    Fetch data from a database with optional JOINs, GROUP BY, and ORDER BY clauses.
 
-data = pd.read_csv(r'C:\Users\Alex\Downloads\NFLData3.csv', low_memory=False).drop(columns=['Unnamed: 0', 'LTime', 'Rk', 'PC', 'PD'])
-data['Date'] = pd.to_datetime(data['Date'])
+    Parameters:
+    - engine: SQLAlchemy engine for database connection.
+    - table_name: Main table name to fetch data from.
+    - cols: Columns to select (default is '*').
+    - joins: List of tuples for JOINs [(join_table, join_condition)].
+    - groupby: Columns for GROUP BY clause.
+    - orderby: Columns for ORDER BY clause.
 
-# selecting only data from 2007 - present (2019)
-data = data[data['Date'].dt.year >= 2007]
-data = data.rename(columns={'Unnamed: 6': 'HomeAway'})
-
-ot_mapping = {'OT': 1, np.NaN: 0}
-data['OT'] = data.loc[data.index, 'OT'].map(ot_mapping)
-data['HomeAway'] = data.loc[data.index, 'HomeAway'].fillna(0).replace('@', 1)
-data['TO'] = data.loc[data.index, 'TO'].fillna(0)
-
-# Select categorical data
-cats = data.select_dtypes(include='object')
-cats.dropna(inplace=True)
-cats.drop(columns=['ToP', 'Time.1', 'Time'], inplace=True)
-
-# Remove Data that has multicollinearity / not as importnant
-data.drop(columns=['Cmp', 'Att', 'Yds', 'Cmp%', 'Int', 'Att.1', 'Yds.2', 'Tot', 'Sk', 'TD', 'TD.1', 'Rate'], inplace=True)
-
-#cumulative columns
-cumcols = ['PF', 'PA', 'Result']
-exclude = ['Tm', 'Year', 'Week']
-
-
-# shifting groups by 1, so x = x + 1
-def custom_shift(group):
-  return group.shift(1) if len(group) > 1 else group
-
-# Wins or loses
-def convert_result(result):
-        if result.startswith('W'):
-            return 1
-        elif result.startswith('L'):
-            return 0
-        else:
-            return 1  # tie game but counted as win... can change
-
-
-data['Result'] = data.loc[data.index, 'Result'].apply(convert_result)
-
-# Converting ToP, Time.1, Time from x:x to integers
-def convert_to_seconds(time_str, desc=0):
-        if pd.notnull(time_str) and desc == 0:
-            hours, minutes = map(int, time_str.split(':'))
-            return (hours * 3600) + (minutes * 60)
-        elif desc == 1:
-            minutes, seconds = map(int, time_str.split(':'))
-            return (minutes * 60) + seconds
-        else:
-            return None
-
-data['Time'] = data.loc[data.index, 'Time'].apply(lambda x: convert_to_seconds(x))
-data['Time.1'] = data.loc[data.index, 'Time.1'].apply(lambda x: convert_to_seconds(x))
-data['ToP'] = data.loc[data.index, 'ToP'].apply(lambda x: convert_to_seconds(x, 1))
-
-# 4 games to predict 5th
-min_games = 4
-def calculate_trailing_average(df, cols):
-      df_sorted = df.sort_values(by=['Tm', 'Year', 'G#'])
-      grouped = df_sorted.groupby(['Tm', 'Year'])
-
-      # average for selected numerical cols
-      trailing_avg_df = grouped[cols].rolling(window=min_games, min_periods=min_games).mean()
-
-
-      # Findng cumsum for select cum cols 
-      csum =  grouped[cumcols].cumsum()
-      csum = csum.add_prefix('cum_')
-      trailing_avg_df.reset_index(inplace=True)
-      trailing_avg_df.set_index('level_2', inplace=True)
-
-      # concating cumsums to trailingavg on cols
-      trailing_avg_df = pd.concat([trailing_avg_df, csum], axis=1)
-
-      # exclude these cols from the shift
-      excl = [col for col in trailing_avg_df.columns if col not in exclude]
-      trailing_avg_df[excl] = trailing_avg_df.groupby(['Tm', 'Year']).transform(custom_shift)
-
-      trailing_avg_df.dropna(inplace=True)
-
-      return trailing_avg_df
-
-# transform the data so we can predict with it
-def trans(df):
-    # Select only numeric columns
-    passnums = df.select_dtypes(include=['int', 'float'])
-    passnums.dropna(inplace=True)
-    # CHECK DROPPED COLUMNS
-    passnums.drop(columns=['Week', 'G#', 'Year', 'Result'], inplace=True)
-
-    trailing = calculate_trailing_average(df, passnums.columns)
-
-    columns_to_include = [col for col in trailing.columns if col not in exclude]
-
-    # remove outliers
-    z_scores = zscore(trailing[columns_to_include])
-    abs_z_scores = abs(z_scores)
-    z_score_threshold = 3
-    outliers = (abs_z_scores > z_score_threshold).any(axis=1)
+    Returns:
+    - DataFrame: Query result as a pandas DataFrame.
+    """
     
-    trailing = trailing[~outliers]
-    # getting the categorical data for trailing
-    trailing[cats.columns] = df.loc[trailing.index, cats.columns]
+    query = f"SELECT {cols} FROM {table_name}"
 
+    if joins:
+        for join_table, join_condition in joins:
+            query += f" JOIN {join_table} ON {join_condition}"
 
-    # Convert categorical columns to numerical codes
-    day_mapping = {'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6}
-    trailing['Day'] = df.loc[trailing.index, 'Day'].map(day_mapping)
-    trailing['Tm'] = df.loc[trailing.index, 'Tm'].astype('category').cat.codes + 1
-    trailing['Opp'] = df.loc[trailing.index, 'Opp'].astype('category').cat.codes + 1
-    trailing['Year'] = df.loc[trailing.index, 'Year']
-    trailing['Time'] = df.loc[trailing.index, 'Time']
-    trailing['Time.1'] = df.loc[trailing.index, 'Time.1']
-    trailing['ToP'] = df.loc[trailing.index, 'ToP']
-    trailing['Result'] = df.loc[trailing.index, 'Result']
-    trailing['Week'] = df.loc[trailing.index, 'Week']
+    if groupby:
+        groupby_clause = ", ".join(groupby)
+        query += f" GROUP BY {groupby_clause}"
 
-
-    # Rank columns
-    wy = trailing.groupby(['Year', 'Week'])
-    trailing['PA_rank'] = wy['cum_PA'].rank(ascending=False)
-    trailing['PF_rank'] = wy['cum_PF'].rank(ascending=True)
-    trailing['Win_rank'] = wy['cum_Result'].rank(ascending=True)
-    
-    
-    # Make sure all Data less than min games is removed
-    trailing = trailing.query(f'Week > {min_games}')
-
-
-    #ADD OPP STATS
-    for index, row in trailing.iterrows():
-      oppteam = row['Opp']
-
-      # extract opponent PF, PA, Winrank
-      opp_row = trailing.loc[(oppteam == trailing['Tm']) & (trailing['Week'] == row['Week']) & (trailing['Year'] == row['Year']), ['PF', 'PA', 'Win_rank']]
-
-      if not opp_row.empty:
-        trailing.at[index, 'Opp_PF'] = opp_row.iloc[0]['PF']
-        trailing.at[index, 'Opp_PA'] = opp_row.iloc[0]['PA']
-        trailing.at[index, 'Opp_WinRank'] = opp_row.iloc[0]['Win_rank']
-
-    return trailing
-
-
-# clean and avg data for predictions
-data = trans(data)
-data.dropna(inplace=True)
-#drop cumcols
-data.drop(columns=['cum_PF', 'cum_PA', 'cum_Result'], inplace=True)
-target = data['Result']
-
-
-# scaling techniques used
-# rob removes the median and scales the data according to the quantile range.
-# The IQR is the range between the 1st quartile (25th quantile) and the 3rd quartile (75th quantile).
-# stan z = (x - u) / s and rob 
-def scale_num(nums):
-    scaled_data = {}
-    scalers = {
-        'rob': RobustScaler(),
-        'stan': StandardScaler()
-    }
-
-    # scaling data with selected scalers and returing df
-    for key, scaler in scalers.items():
-        scaled_data[key] = pd.DataFrame(scaler.fit_transform(nums), columns=nums.columns)
+    if orderby:
+        orderby_clause = ", ".join(orderby)
+        query += f" ORDER BY {orderby_clause}"
         
-    return scaled_data
+    return pd.read_sql(query, engine)
 
-#selecting all numbers to scale
-nums = data.select_dtypes(include=[np.number])
-# DROP TARGET VAR
-nums.drop(columns='Result', inplace=True)
-scalie = scale_num(nums)
+################################################################################
+# Convert 'Record' column to a percentage, -1 for first week
+def record_to_percentage(record):
+    try:
+        wins, games = map(int, record.split('/'))
+        return (wins / games) * 100 if games > 0 else 0
+    except:
+        return -1  # Handle invalid or missing data gracefully
 
-# check for multicollinearity
-def vif(data, threshold_vif):
-    results = {}
-    for key, df in data.items():
-        vif = pd.DataFrame()
-        vif['Variable'] = df.columns
-        vif['VIF'] = [variance_inflation_factor(df.values, i) for i in range(df.shape[1])]
-        high_vif_variables = vif[vif['VIF'] >= threshold_vif]['Variable'].tolist()
-        selected_features = vif[~vif['Variable'].isin(high_vif_variables)]['Variable'].tolist()
-        results[key] = df[selected_features]
-    return results
+################################################################################
+def custom_shift(group):
+    return group.shift(1) if len(group) > 1 else group
 
+###############################################################################
+def shift_vals(df, cols):
+    results_df = pd.DataFrame(index=df.index)
+    df_sorted = df.sort_values(by=['FullTeam', 'Season', 'Game_Week'])
+    grouped = df_sorted.groupby(['FullTeam', 'Season'])
+    
+    prcolumns = [col for col in cols]
+    prefixed_columns = ['Shifted_' + col for col in prcolumns]
+    
+    results_df[prefixed_columns] = grouped[cols].transform(custom_shift)
+    results_df.dropna(inplace=True)
+    return results_df
 
+###############################################################################
+### ema tested 8/18 confirmed to work and usese 4th previous to predict 5th
+### must shift both ema and trailing avg
 
-# Linear classifiers
-lin = {
-        'sgd': SGDClassifier(), 'lr': LogisticRegression(), 'pa': PassiveAggressiveClassifier(),
-'per': Perceptron(), 'rd': RidgeClassifier(),
-    }
+def rolling_window_ema(group, columns):
+    ema_df = pd.DataFrame()
+    for col in columns:
+        # Compute EMA for the column
+        ema_col = group[col].ewm(alpha=0.6).mean()
+        # Shift the EMA values by 1 within the group
+        ema_df[f'EMA_{col}'] = ema_col.shift(1)
+        
+    return ema_df
 
-# Discriminant Analysis
-disc = {
-    'ld': LinearDiscriminantAnalysis(),
-    'quad': QuadraticDiscriminantAnalysis()
-}
+###############################################################################
+def calculate_ema_average(df, cols):
+    # Sort and group the data
+    df_sorted = df.sort_values(by=['FullTeam', 'Season', 'Game_Week'])
+    grouped = df_sorted.groupby(['FullTeam', 'Season'])
 
-# Nearest Neighbors
-knear = {
-    'knn': KNeighborsClassifier(),
-    'ncen': NearestCentroid()
-}
-#', 'rad': RadiusNeighborsClassifier(),
+    # Apply rolling_window_ema to each group
+    trailing_ema_df = grouped.apply(lambda g: rolling_window_ema(g, cols), include_groups=False)
+    
+    ## resest index
+    trailing_ema_df.reset_index(inplace=True)
 
-# Neural network models
-nn = {
-    'bnb':  BernoulliNB(),
-    'ml':  MLPClassifier()
-}
+    ## make level_2 the index which is what it was in original df
+    trailing_ema_df.set_index('level_2', inplace=True)
+    return trailing_ema_df
 
-# Support Vector Machines
-svm = {
-    'svc': SVC(),
-    'linsvc':LinearSVC(),
-}
-#'nsvc':NuSVC(),
+################################################################################
+###############################################################################
+def target_encoder(train_df, val_df, cats_cols, target):
+    """
+    Encodes categorical columns with target encoding, ensuring no data leakage.
 
-#Gaussian Processes Naive Bayes
-bay = {
-    'gauspc': GaussianProcessClassifier(),
-    'gausnb': GaussianNB()
-}
-#NO NEGATIVE VALUES
-# 'comp':ComplementNB(),
-# 'mnom': MultinomialNB(),
+    Parameters:
+    train_df (pd.DataFrame): Training DataFrame.
+    val_df (pd.DataFrame): Validation DataFrame.
+    cats_cols (list): List of categorical column names to encode.
+    target (str): Target column name for encoding.
 
-dtree = {
-    'dt': DecisionTreeClassifier(),
-    'et': ExtraTreeClassifier(),
-    'rfc': RandomForestClassifier()
-}
+    Returns:
+    pd.DataFrame, pd.DataFrame: Encoded training and validation DataFrames.
+    """
+    train_encoded = train_df.copy()
+    val_encoded = val_df.copy()
 
-glm = {
-    'gradboost': GradientBoostingClassifier(),
-    'hist': HistGradientBoostingClassifier()
-}
+    # Encode 'FullTeam' and 'Opp' with same values
+    if 'FullTeam' in cats_cols and 'Opp' in cats_cols:
+        team_target_means = train_df.groupby('FullTeam')[target].mean()
+        train_encoded['FullTeam'] = train_df['FullTeam'].map(team_target_means)
+        train_encoded['Opp'] = train_df['Opp'].map(team_target_means)
+        val_encoded['FullTeam'] = val_df['FullTeam'].map(team_target_means)
+        val_encoded['Opp'] = val_df['Opp'].map(team_target_means)
 
-d = {
-    'iso': IsolationForest()
-}
+        cats_cols = [col for col in cats_cols if col not in ['FullTeam', 'Opp']]
 
+    # Encode remaining categorical columns
+    for col in cats_cols:
+        col_means = train_df.groupby(col)[target].mean()
+        
+        train_encoded[col] = train_df[col].map(col_means)
+        val_encoded[col] = val_df[col].map(col_means)
 
-lr_grid = {
-        'penalty': ['l1', 'l2'],
-        'C': [0.001, 1, 10],
-        'solver': ['liblinear'],
-        'class_weight': [None, 'balanced'],
-        'max_iter': [1000]
-    }
+    return train_encoded, val_encoded
 
-pa_grid = {
-    'C': [.01, 1, 1.5],
-    'loss': ['hinge', 'squared_hinge'],
-    'class_weight': [None, 'balanced']
-}
+###############################################################################
+class TemporalSeasonSplitter(BaseCrossValidator):
+    def __init__(self, n_train_weeks):
+        self.n_train_weeks = n_train_weeks  # Number of weeks to use for training
 
-per_grid = {
-    'alpha': [.01, 1, 2],
-    'penalty': ['l1', 'l2', 'elasticnet', None],
-    'class_weight': [None, 'balanced']
-}
+    def split(self, X, y=None, groups=None):
+        """
+        groups: Unique identifiers for season_week (e.g., '2021_1').
+        """
+        unique_seasons = X['Season'].unique()
 
-rd_grid = {
-    'alpha': [.01, .2, .8],
-    'solver': ['auto', 'svd', 'lsqr'],
-    'class_weight': [None, 'balanced']
-}
+        for season in unique_seasons:
+            # Sort by season and week to guarantee chronological order
+            season_data = X[X['Season'] == season].sort_values(by='Game_Week')
+            
+            # Split into training and validation based on weeks
+            train_data = season_data[season_data['Game_Week'] <= self.n_train_weeks]
+            val_data = season_data[season_data['Game_Week'] > self.n_train_weeks]
 
-sgd_grid = {
-    'loss': ['perceptron', 'modified_huber', 'squared_hinge', 'hinge', 'log_loss'],
-    'penalty': ['l1', 'l2', 'elasticnet'],
-}
+            train_idx = train_data.index
+            val_idx = val_data.index
 
-ld_grid = {
-    'solver': ['svd', 'lsqr', 'eigen']
-}
+            yield train_idx, val_idx
 
-quad_grid = {
-    'reg_param': [0, .5, 1]
-}
-
-knn_grid = {
-    'n_neighbors': [10,11],
-    'weights': ['uniform', 'distance'],
-    'algorithm': ['ball_tree'], # , 'kd_tree', 'brute'
-    'leaf_size': [5, 10],
-    'metric': ['euclidean', 'manhattan'], # , 'chebyshev', 'minkowski'
-    'p': [1, 2]
-}
+    def get_n_splits(self, X=None, y=None, groups=None):
+        return len(X['Season'].unique())  # One split per season
 
 
-ncen_grid = {
-    'metric': ['euclidean', 'manhattan']
-}
+###############################################################################
+###############################################################################
+###############################################################################
+games_df = fetch_existing_data(engine, 'games', orderby=['Game_Date'])
 
-bnb_grid = {
-    'alpha': [.1, .5, 1, 1.5]
-}
+## can drop games_id and FullTeam cols, have Tm to use as our main
+games_df.drop(columns=['games_id', 'Tm'], inplace=True)
 
-#takes a long time lbfgs failed
-ml_grid = {
-    'hidden_layer_sizes': [(50,), (100,), (50, 50), (100, 100)],
-    'activation': ['logistic', 'tanh', 'relu', 'identity'],
-    'solver': ['lbfgs', 'adam', 'sgd'],
-    'learning_rate': ['constant', 'adaptive', 'invscaling'],
-    'max_iter': [500]
-}
+day_mapping = {'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6}
+games_df['Game_Day'] = games_df.loc[:, 'Game_Day'].map(day_mapping)
+    
+# Change x/x to % won and shift records by 1
+games_df['Record'] = games_df.groupby(['FullTeam', 'Season'])['Record'].transform(custom_shift)
+games_df['Record'] = games_df['Record'].apply(record_to_percentage)
 
-svc_grid = {
-    'C': [.1, .5, 1],
-    'gamma': ['scale', 'auto'],
-    'class_weight': [None, 'balanced'],
-}
+games_df['Beat_Spread'] = games_df.groupby(['FullTeam', 'Season'])['Beat_Spread'].transform(custom_shift)
 
-# 'kernel': ['linear', 'poly', 'rbf', 'sigmoid'],
+shift_cols = ['Duration', 'PF', 'PA', 'First_Downs', 'Total_Yards', 'Turnovers',
+ 'Third_Down_Conv_', 'Fourth_Down_Conv_', 'Time_of_Possession', 'Penalties',
+ 'Penalty_Yards', 'Spread']
 
+### ema of shifted cols
+ema_df = calculate_ema_average(games_df, shift_cols)
+ema_df.dropna(inplace=True)
 
-linsvc_grid = {
-    'penalty': ['l1', 'l2'],
-    'loss': ['hinge', 'squared_hinge'],
-    'C': [.1, .5, .9],
-    'class_weight': [None, 'balanced']
-}
+shift_by_1 = ['Beat_Spread', 'Record']
 
+# concat games_df no_shift cols back with index 'level_2' of games_df 
+# FullTeam and Season are already in the ema_df so they are taken out
+# add shift_by_1 after shifting those records
+no_shift = ['Opp', 'Coach', 'Stadium', 'Surface', 'Roof', 'Game_Week', 'Game_Date',
+            'Game_Day', 'Link', 'Start_Time', 'Attendance', 'Spread', 'Over_Under',
+            'Temperature', 'Humidity', 'Wind', 'Rest', 'HA', 'Result'] + shift_by_1
 
-dt_grid = {
-    'criterion': ['gini', 'entropy', 'log_loss'],
-    'max_depth': [None, 30, 100],
-    'max_features': [None, 'sqrt', 'log2']
-}
+no_shift_data = games_df[no_shift]
 
-et_grid = {
-    'criterion': ['gini', 'entropy', 'log_loss'],
-    'max_depth': [None, 30, 100],
-    'max_features': [None, 'sqrt', 'log2']
-}
+no_shift_data_reindexed = no_shift_data.reindex(ema_df.index)
+ema_df_combined = pd.concat([ema_df, no_shift_data_reindexed], axis=1)
+ema_df_combined.drop(columns=['Game_Date', 'Start_Time'], inplace=True)
 
-rfc_grid = {
-    'criterion': ['gini', 'entropy', 'log_loss'],
-    'max_depth': [None, 30, 100],
-    'max_features': [None, 'sqrt', 'log2']
-}
+################################################################################
+# add FullTeam + 'Stadium', 'Surface', 'Roof' 
+# 'Coach' and Record are very similar
+cats_cols = ['FullTeam', 'Opp', 'Coach', 'Stadium', 'Surface', 'Roof']
+# str_encoder = TargetEncoder()
 
+discrete_cols = ['Season', 'Game_Week', 'Game_Day', 'Beat_Spread', 'Result', 'Turnovers', 'Rest', 'Penalties', 'HA']
 
-featsel = {
-    'kb6': SelectKBest(k=6),
-    'kb7': SelectKBest(k=7),
-    'kb8': SelectKBest(k=8),
-    'kb9': SelectKBest(k=9),
-}
+# TOOK OUT EMA_First_Downs, EMA_Penalties
+continous_cols = ['EMA_Duration', 'EMA_PF', 'EMA_PA',
+       'EMA_Total_Yards', 'EMA_Turnovers',
+       'EMA_Third_Down_Conv_', 'EMA_Fourth_Down_Conv_',
+       'EMA_Time_of_Possession', 'EMA_Penalty_Yards',
+       'EMA_Spread'] # 'Over_Under', 'Record'
 
 
-def train_and_evaluate(features, target, model):
-    X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, random_state=42)
-
-    model.fit(X_train, y_train)
-    ypred = model.predict(X_test)
-    acc = accuracy_score(y_test, ypred)
-    roc = roc_auc_score(y_test, ypred)
-    f1 = f1_score(y_test, ypred)
-
-    return {'accuracy': acc, 'roc_auc': roc, 'f1_score': f1}
-
-vif(scalie, 8)
-def itry(featsel, vif_features, target, models):
-    results = {}
-
-    for key, value in featsel.items():
-        for prekey, prevalue in vif_features.items():
-            redue_key = f'{key}_{prekey}'
-            selected_features = value.fit_transform(prevalue, target)
-            selected_mask = value.get_support()
-
-            selected_names = prevalue.columns[selected_mask]
-            selected_data = pd.DataFrame(selected_features, columns=selected_names)
-
-            for mod, tech in models.items():
-                model = tech
-                nkey = f'{mod}_{redue_key}'
-
-                model_results = train_and_evaluate(selected_data, target, model)
-                results[nkey] = model_results
-
-    return results
+test_df = ema_df_combined[['EMA_Duration', 'EMA_PF', 'EMA_PA',
+       'EMA_First_Downs', 'EMA_Total_Yards', 'EMA_Turnovers',
+       'EMA_Third_Down_Conv_', 'EMA_Fourth_Down_Conv_', 'HA', 'Game_Day',
+       'EMA_Time_of_Possession', 'EMA_Penalties', 'EMA_Penalty_Yards',
+       'EMA_Spread', 'Result', 'Season', 'Game_Week', 'Spread',
+       'Rest', 'FullTeam', 'Opp', 'Coach', 'Stadium', 'Surface', 'Roof']]
 
 
-# models >>> lin, disc, knear, nn, svm, bay, dtree
-results = itry(featsel, vif(scalie, 8), target, disc)
+test_df = test_df.sort_values(by=['Season', 'Game_Week']).reset_index(drop=True)
+target = test_df['Result']
+#test_df.drop(columns=['Result', 'Link', 'Attendance', 'FullTeam', 'Season'], inplace=True)
 
-result_rows = []
-for key, values in results.items():
-    result_rows.append([key, values['accuracy'], values['roc_auc'], values['f1_score']])  # Assuming key is nkey
+temporal_splitter = TemporalSeasonSplitter(n_train_weeks=8)
 
-df = pd.DataFrame(result_rows, columns=['Model', 'Accuracy', 'ROC_AUC', 'F1'])
-df_sorted = df.sort_values(by='Accuracy', ascending=False)
+logreg = LogisticRegression(random_state=0, max_iter=1000)
 
-print(df_sorted.to_string())
+feature_columns = [
+    'EMA_Duration', 'EMA_PF', 'EMA_PA', 'EMA_Total_Yards',
+    'EMA_Turnovers', 'EMA_Third_Down_Conv_', 'EMA_Fourth_Down_Conv_',
+    'EMA_Time_of_Possession', 'EMA_Penalty_Yards', 'Rest',
+    'EMA_Spread', 'Spread']
+
+accuracies, precisions, recalls, f1_scores, aucs = [], [], [], [], []
+
+# Number of features to select
+k = 1  
+
+## result for 1 feature (Spread), simplest model with highest accuracy
+# Mean Accuracy: 0.6962 ± 0.0412
+# Mean Precision: 0.6970 ± 0.0387
+# Mean Recall: 0.6976 ± 0.0435
+# Mean F1 Score: 0.6973 ± 0.0410
+# Mean ROC AUC: 0.7508 ± 0.0484
 
 
+# Loop through each Season 1-8 is train
+# 9-18 is test set
+# however many seasons is how many folds
+for train_idx, val_idx in temporal_splitter.split(test_df):
+    # Split into training and validation sets
+    train_data = test_df.iloc[train_idx]
+    val_data = test_df.iloc[val_idx]
 
+    # Separate features and target
+    X_train = train_data[feature_columns]
+    y_train = train_data['Result']
+    X_val = val_data[feature_columns]
+    y_val = val_data['Result']
+
+    # StandardScaler mean = 0, std = 1 > only works on continous
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    
+    # Feature selection with SelectKBest... f_classif = ANOVA
+    selector = SelectKBest(score_func=f_classif, k=k)
+    X_train_selected = selector.fit_transform(X_train_scaled, y_train)
+    X_val_selected = selector.transform(X_val_scaled)
+    
+    
+    model = LogisticRegression(random_state=42, max_iter=1000)
+    model.fit(X_train_selected, y_train)
+
+    y_pred = model.predict(X_val_selected)
+    y_pred_proba = model.predict_proba(X_val_selected)[:, 1]
+
+    accuracy = accuracy_score(y_val, y_pred)
+    precision = precision_score(y_val, y_pred, zero_division=1)
+    recall = recall_score(y_val, y_pred)
+    f1 = f1_score(y_val, y_pred)
+    auc = roc_auc_score(y_val, y_pred_proba)
+
+    print("Fold Metrics:")
+    print(f"Accuracy: {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1 Score: {f1:.4f}")
+    print(f"ROC AUC: {auc:.4f}")
+    print("Selected Features:", [feature_columns[i] for i in selector.get_support(indices=True)])
+    print("-" * 50)
+    accuracies.append(accuracy)
+    precisions.append(precision)
+    recalls.append(recall)
+    f1_scores.append(f1)
+    aucs.append(auc)
+    print("-" * 50)
+
+    
+# Print average metrics across folds
+print(f"Mean Accuracy: {np.mean(accuracies):.4f} ± {np.std(accuracies):.4f}")
+print(f"Mean Precision: {np.mean(precisions):.4f} ± {np.std(precisions):.4f}")
+print(f"Mean Recall: {np.mean(recalls):.4f} ± {np.std(recalls):.4f}")
+print(f"Mean F1 Score: {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}")
+print(f"Mean ROC AUC: {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
