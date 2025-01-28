@@ -1,13 +1,10 @@
 import pandas as pd 
+import numpy as np
 from sqlalchemy import create_engine
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.preprocessing import TargetEncoder
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import BaseCrossValidator
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-import numpy as np
 from sklearn.feature_selection import SelectKBest, f_classif
 
 engine = create_engine('mysql+pymysql://root:password@127.0.0.1:3306/sys')    
